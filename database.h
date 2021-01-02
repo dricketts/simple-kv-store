@@ -2,6 +2,7 @@
 #include <map>
 #include <unordered_set>
 #include <functional>
+#include <mutex>
 
 /*
  * This class implements a transactional key-value store with an extremely
@@ -52,6 +53,7 @@ using Transaction = std::function<bool (ReadFn, WriteFn)>;
 // TODO: is there a way to make this private while still defining
 // LOG_HEADER_SIZE in the CPP file?
 struct LogHeader;
+struct LogSlot;
 
 // TODO: add more information to transaction result
 enum class TransactionResult {
@@ -84,8 +86,9 @@ private:
     TransactionResult tryCommit(bool wantsCommit, const TransactionMD& txnMD);
     bool checkConflicts(const TransactionMD& txnMD) const;
 
-    // TODO: should the return a pointer or a reference?
     LogHeader* getLogHeader();
+    LogSlot* getNextHead();
+    void updateLogHeader(LogSlot* newHead);
 
     // TODO: error codes/exceptions??
     void open(const std::string& fileName);
@@ -95,4 +98,5 @@ private:
 
     void* fileMemory;
     long fileSize;
+    std::mutex commitMutex;
 };

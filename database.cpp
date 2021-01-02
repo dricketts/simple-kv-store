@@ -3,15 +3,22 @@
 struct LogHeader {
     // TODO: add CRC
 
-    // Pointers relative to the start of the log portion of fileMemory
-    // The log slots are all the bits between tail and head.
+    // Indexes into LogSlot array in the log portion of fileMemory
     long tail;
     long head;
 };
 
+struct KeyValue {
+    Key key;
+    Value value;
+};
+
+static const int MAX_KEYS_PER_LOG_SLOT = 64;
+
 struct LogSlot {
     // TODO: add CRC
-
+    int numKvs;
+    KeyValue kvs[MAX_KEYS_PER_LOG_SLOT];
 };
 
 static const long LOG_HEADER_SIZE = sizeof(LogHeader);
@@ -20,7 +27,7 @@ static const long LOG_HEADER_SIZE = sizeof(LogHeader);
 // TODO: there's probably some alignment stuff to worry about as well.
 static_assert(LOG_HEADER_SIZE <= 512, "Log header size exceeds atomic write unit size.");
 static const long LOG_SLOT_SIZE = sizeof(LogSlot);
-static const long NUM_LOG_SLOT = 128;
+static const int NUM_LOG_SLOT = 128;
 static const long FILE_SIZE = LOG_HEADER_SIZE + NUM_LOG_SLOT * LOG_SLOT_SIZE;
 
 Database::Database(const std::string& fileName, bool doFormat) {
@@ -58,6 +65,8 @@ struct Database::TransactionMD {
     std::unordered_set<Key> readSet;
 };
 
+// TODO: handle too many writes here.
+// Also, give read and write some way of failing the transaction.
 TransactionResult Database::performTransaction(Transaction txn) {
     Database::TransactionMD txnMD = beginTransaction();
     auto txnRead = [this, &txnMD](const Key& key) -> const Value* {
@@ -88,11 +97,37 @@ void Database::write(const Key& key, const Value& value, std::map<Key, Value>& w
 TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txnMD) {
     // For simplicitly do all of this in a critical section.
     //   1. conflict checking - just look at the latest tree or whatever data structure
-    //   2. Write data up to new root
+    //   2. Append log entry
     //   3. Fsync
-    //   4. Update next meta page
+    //   4. Update log header
     //   5. Fsync (possibly piggyback this on fsync for next transaction)
+    //   6. Update index
     // There might be ways to increase concurrency here.
+    std::scoped_lock lock(commitMutex);
+
+    // Step 1
+    if (!checkConflicts(txnMD)) return TransactionResult::Conflict;
+
+    // Step 2
+    LogSlot* head = getNextHead();
+    head->numKvs = txnMD.writes.size();
+    int i = 0;
+    for (auto& [k, v] : txnMD.writes) {
+        head->kvs[i++] = {k, v};
+    }
+
+    // Step 3
+    persist();
+
+    // Step 4
+    updateLogHeader(head);
+
+    // Step 5
+    persist();
+
+    // Step 6
+    // TODO
+
     return TransactionResult::Success;
 }
 
@@ -103,4 +138,16 @@ bool Database::checkConflicts(const TransactionMD& txnMD) const {
 LogHeader* Database::getLogHeader() {
     // TODO: is this a good idea?
     return reinterpret_cast<LogHeader*>(fileMemory);
+}
+
+// TODO: this needs to wait for readers at the tail
+LogSlot* Database::getNextHead() {
+    LogHeader* lh = getLogHeader();
+    long idx = (lh->head + 1) % NUM_LOG_SLOT;
+    LogSlot* log = reinterpret_cast<LogSlot*>(lh + 1);
+    return log + idx;
+}
+
+void Database::updateLogHeader(LogSlot* newHead) {
+
 }

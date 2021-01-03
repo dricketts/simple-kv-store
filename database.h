@@ -3,6 +3,7 @@
 #include <unordered_set>
 #include <functional>
 #include <mutex>
+#include <memory>
 
 /*
  * This class implements a transactional key-value store with an extremely
@@ -46,7 +47,7 @@
  */
 using Key = std::string;
 using Value = std::string;
-using ReadFn = std::function<const Value* (const Key&)>;
+using ReadFn = std::function<const std::optional<Value> (const Key&)>;
 using WriteFn = std::function<void (const Key& key, const Value& value)>;
 using Transaction = std::function<bool (ReadFn, WriteFn)>;
 
@@ -78,25 +79,34 @@ public:
 private:
     struct TransactionMD;
 
-    // TODO: get the root, reserve stuff, do beginTxn stuff
     TransactionMD beginTransaction();
-    // TODO: is there a way to return a reference to somewhere in fileMemory, instead of a pointer?
-    const Value* read(const Key& key, TransactionMD& root) const;
+    const std::optional<Value> read(const Key& key, TransactionMD& txnMD) const;
     void write(const Key& key, const Value& value, std::map<Key, Value>& writes) const;
     TransactionResult tryCommit(bool wantsCommit, const TransactionMD& txnMD);
     bool checkConflicts(const TransactionMD& txnMD) const;
 
-    LogHeader* getLogHeader();
-    LogSlot* getNextHead();
-    void updateLogHeader(LogSlot* newHead);
-
     // TODO: error codes/exceptions??
-    void open(const std::string& fileName);
+    void openFile(const std::string& fileName, bool doFormat);
     void format();
-    void close();
+    void replay();
+    void closeFile();
     void persist();
 
-    void* fileMemory;
+    using LogPointer = char*;
+    using Index = std::map<Key, LogPointer>;
+
+    LogHeader* getLogHeader() const;
+    LogSlot* getLogSlot(long n) const;
+    void append(const std::map<Key, Value>& kvs, Index& newIndex);
+
+    std::shared_ptr<Index> getIndex();
+    void updateIndex(const Index& newIndex);
+
+    std::tuple<Key, Value, LogPointer> getKV(const LogPointer lp) const;
+
+    int fd;
+    char* fileMemory;
     long fileSize;
     std::mutex commitMutex;
+    std::shared_ptr<Index> latestIndex;
 };

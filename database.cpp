@@ -1,8 +1,9 @@
 #include "database.h"
-#include <assert.h>
+#include <cassert>
 #include <cstring>
 #include <atomic>
 #include <algorithm>
+#include <iostream>
 
 // for mmap
 #include <sys/mman.h>
@@ -13,7 +14,7 @@
 struct LogHeader {
     // TODO: add CRC
 
-    // Index into LogSlot array in the log portion of fileMemory
+    // Next logical log slot to be appended.
     long head;
 };
 
@@ -98,7 +99,7 @@ void Database::openFile(const std::string& fileName, bool doFormat) {
 void Database::replay() {
     Index index;
     const LogHeader* lh = getLogHeader();
-    for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT); slot <= lh->head; ++slot) {
+    for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT); slot < lh->head; ++slot) {
         LogSlot* ls = getLogSlot(slot);
         LogPointer lp = ls->kvs;
         for (int i = 0; i < ls->numKvs; ++i) {
@@ -163,7 +164,7 @@ const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) 
     if (auto it = txnMD.writes.find(key); it != txnMD.writes.end()) {
         return it->second;
     }
-    
+
     // Read from the index
     auto it = txnMD.readIndex.get()->find(key);
     if (it == txnMD.readIndex.get()->end()) return {};
@@ -217,7 +218,7 @@ static char* memcpyString(char* dest, const std::string& str) {
 void Database::append(const std::map<Key, Value>& kvs, Index& newIndex) {
     LogHeader* lh = getLogHeader();
     
-    long slot = lh->head + 1;
+    long slot = lh->head;
     LogSlot* next = getLogSlot(slot);
     
     next->numKvs = kvs.size();

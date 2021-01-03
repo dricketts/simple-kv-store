@@ -4,6 +4,7 @@
 #include <functional>
 #include <mutex>
 #include <memory>
+#include <cassert>
 
 /*
  * This class implements a transactional key-value store with an extremely

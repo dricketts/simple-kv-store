@@ -118,7 +118,7 @@ void Database::closeFile() {
 }
 
 void Database::persist() {
-
+    fsync(fd);
 }
 
 struct Database::TransactionMD {
@@ -156,8 +156,15 @@ std::tuple<Key, Value, Database::LogPointer> Database::getKV(const LogPointer lp
     return {key, value, vp + vsize};
 }
 
-// TODO: implement
 const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) const {
+    txnMD.readSet.insert(key);
+
+    // Try to read from local writes
+    if (auto it = txnMD.writes.find(key); it != txnMD.writes.end()) {
+        return it->second;
+    }
+    
+    // Read from the index
     auto it = txnMD.readIndex.get()->find(key);
     if (it == txnMD.readIndex.get()->end()) return {};
     auto [k, v, _] = getKV(it->second);

@@ -3,20 +3,15 @@
 #include <cstring>
 #include <atomic>
 #include <algorithm>
+#include <future>
 #include <iostream>
 
 // for mmap
+#include <mutex>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-
-struct LogHeader {
-    // TODO: add CRC
-
-    // Next logical log slot to be appended.
-    long head;
-};
 
 static const long INT_SIZE = sizeof(int);
 static const long MAX_NUM_KV_PAIRS = 64;
@@ -52,9 +47,19 @@ Database::Database(const std::string& fileName, bool doFormat) {
     openFile(fileName, doFormat);
     if (doFormat) format();
     replay();
+    pendingIndex = *latestIndex.get();
+
+    cancelFuture = cancelPromise.get_future();
+
+    std::promise<void> commitPromise;
+    commitFuture = commitPromise.get_future();
+    commitThread = std::thread(&Database::commitLoop, this, std::move(commitPromise));
 }
 
 Database::~Database() {
+    cancelPromise.set_value();
+    commitThread.join();
+
     closeFile();
 }
 
@@ -187,17 +192,16 @@ TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txn
     //   5. Fsync (possibly piggyback this on fsync for next transaction)
     //   6. Update index
     // There might be ways to increase concurrency here.
-    std::scoped_lock lock(commitMutex);
+    std::unique_lock lock(commitMutex);
 
     // Step 1
     if (!checkConflicts(txnMD)) return TransactionResult::Conflict;
 
     // Step 2-6
-    std::shared_ptr<Index> index = getIndex();
-    // Just make a copy of the entire index for now.
-    Index newIndex = *index.get();
-    append(txnMD.writes, newIndex);
-    updateIndex(newIndex);
+    auto commitFuture = append(txnMD.writes, pendingIndex);
+    lock.unlock();
+
+    commitFuture.wait();
 
     return TransactionResult::Success;
 }
@@ -215,7 +219,7 @@ static char* memcpyString(char* dest, const std::string& str) {
     return dest;
 }
 
-void Database::append(const std::map<Key, Value>& kvs, Index& newIndex) {
+std::shared_future<void> Database::append(const std::map<Key, Value>& kvs, Index& newIndex) {
     LogHeader* lh = getLogHeader();
     
     long slot = lh->head;
@@ -229,11 +233,32 @@ void Database::append(const std::map<Key, Value>& kvs, Index& newIndex) {
         buf = memcpyString(buf, v);
     }
 
-    persist();
+    pendingHeader.head = slot + 1;
 
-    lh->head++;
+    return commitFuture;
+}
 
-    persist();
+void Database::commitLoop(std::promise<void> commitPromise) {
+    LogHeader* lh = getLogHeader();
+    
+    std::promise<void> currentCommitPromise;
+    std::promise<void> nextCommitPromise = std::move(commitPromise);
+
+    while (cancelFuture.wait_for(std::chrono::milliseconds(10)) ==
+            std::future_status::timeout) {
+        std::scoped_lock lock(commitMutex);
+        persist();
+        currentCommitPromise.set_value();
+        currentCommitPromise = std::move(nextCommitPromise);
+        nextCommitPromise = std::promise<void>();
+        commitFuture = nextCommitPromise.get_future();
+
+        auto temp = pendingIndex;
+        updateIndex(pendingIndex);
+        pendingIndex = std::move(temp);
+
+        *lh = pendingHeader;
+    }
 }
 
 LogHeader* Database::getLogHeader() const {

@@ -1,10 +1,13 @@
 #include <string>
 #include <map>
 #include <unordered_set>
+#include <queue>
 #include <functional>
 #include <mutex>
 #include <memory>
 #include <cassert>
+#include <thread>
+#include <future>
 
 /*
  * This class implements a transactional key-value store with an extremely
@@ -54,7 +57,12 @@ using Transaction = std::function<bool (ReadFn, WriteFn)>;
 
 // TODO: is there a way to make this private while still defining
 // LOG_HEADER_SIZE in the CPP file?
-struct LogHeader;
+struct LogHeader {
+    // TODO: add CRC
+
+    // Next logical log slot to be appended.
+    long head;
+};
 struct LogSlot;
 
 // TODO: add more information to transaction result
@@ -98,7 +106,8 @@ private:
 
     LogHeader* getLogHeader() const;
     LogSlot* getLogSlot(long n) const;
-    void append(const std::map<Key, Value>& kvs, Index& newIndex);
+    std::shared_future<void> append(const std::map<Key, Value>& kvs, Index& newIndex);
+    void commitLoop(std::promise<void> commitPromise);
 
     std::shared_ptr<Index> getIndex();
     void updateIndex(const Index& newIndex);
@@ -108,6 +117,15 @@ private:
     int fd;
     char* fileMemory;
     long fileSize;
+
     std::mutex commitMutex;
     std::shared_ptr<Index> latestIndex;
+    Index pendingIndex;
+    LogHeader pendingHeader;
+
+    std::promise<void> cancelPromise;
+    std::shared_future<void> cancelFuture;
+    
+    std::shared_future<void> commitFuture;
+    std::thread commitThread;
 };

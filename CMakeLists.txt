@@ -10,4 +10,8 @@ include_directories(.)
 
 file(GLOB SOURCES "*.cpp")
 
+find_package( Threads )
+
 add_executable(Test ${SOURCES})
+
+target_link_libraries( Test ${CMAKE_THREAD_LIBS_INIT} )

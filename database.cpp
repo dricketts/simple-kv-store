@@ -1,5 +1,4 @@
 #include "database.h"
-#include <cassert>
 #include <cstring>
 #include <atomic>
 #include <algorithm>
@@ -12,6 +11,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "util.h"
 
 static const long INT_SIZE = sizeof(int);
 static const long MAX_NUM_KV_PAIRS = 64;
@@ -37,9 +38,11 @@ static const long LOG_HEADER_SIZE = sizeof(LogHeader);
 // TODO: there's probably some alignment stuff to worry about as well.
 static_assert(LOG_HEADER_SIZE <= 512, "Log header size exceeds atomic write unit size.");
 static const long LOG_SLOT_SIZE = sizeof(LogSlot);
-static const long NUM_LOG_SLOT = 128;
+// Number of consecutive log slots required to replay the state machine
+static const long NUM_LOG_SLOT_REPLAY = 128;
 // One extra log slot because log slot writes are not necessarily atomic.
-static const long FILE_SIZE = LOG_HEADER_SIZE + (NUM_LOG_SLOT + 1) * LOG_SLOT_SIZE;
+static const long NUM_LOG_SLOT = NUM_LOG_SLOT_REPLAY + 1;
+static const long FILE_SIZE = LOG_HEADER_SIZE + NUM_LOG_SLOT * LOG_SLOT_SIZE;
 
 using Log = LogSlot[NUM_LOG_SLOT];
 
@@ -47,7 +50,8 @@ Database::Database(const std::string& fileName, bool doFormat) {
     openFile(fileName, doFormat);
     if (doFormat) format();
     replay();
-    pendingIndex = *latestIndex.get();
+    
+    resetPending();
 
     cancelFuture = cancelPromise.get_future();
 
@@ -92,7 +96,9 @@ void Database::openFile(const std::string& fileName, bool doFormat) {
         handle_error("file size");
     
     if (doFormat) {
-        ftruncate(fd, FILE_SIZE);
+        if (ftruncate(fd, FILE_SIZE) == -1) {
+            handle_error("truncate");
+        };
         fileSize = FILE_SIZE;
     }
     
@@ -104,7 +110,7 @@ void Database::openFile(const std::string& fileName, bool doFormat) {
 void Database::replay() {
     Index index;
     const LogHeader* lh = getLogHeader();
-    for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT); slot < lh->head; ++slot) {
+    for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT_REPLAY); slot < lh->head; ++slot) {
         LogSlot* ls = getLogSlot(slot);
         LogPointer lp = ls->kvs;
         for (int i = 0; i < ls->numKvs; ++i) {
@@ -174,7 +180,7 @@ const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) 
     auto it = txnMD.readIndex.get()->find(key);
     if (it == txnMD.readIndex.get()->end()) return {};
     auto [k, v, _] = getKV(it->second);
-    assert(k == key);
+    ASSERT_EQ(k, key);
     return v;
 }
 
@@ -198,7 +204,7 @@ TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txn
     if (!checkConflicts(txnMD)) return TransactionResult::Conflict;
 
     // Step 2-6
-    auto commitFuture = append(txnMD.writes, pendingIndex);
+    auto commitFuture = append(txnMD.writes);
     lock.unlock();
 
     commitFuture.wait();
@@ -219,21 +225,15 @@ static char* memcpyString(char* dest, const std::string& str) {
     return dest;
 }
 
-std::shared_future<void> Database::append(const std::map<Key, Value>& kvs, Index& newIndex) {
-    LogHeader* lh = getLogHeader();
+// Precondition: thread holds commitMutex
+std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
     
-    long slot = lh->head;
-    LogSlot* next = getLogSlot(slot);
-    
-    next->numKvs = kvs.size();
-    char* buf = next->kvs;
+    pendingLogSlot->numKvs += kvs.size();
     for (auto& [k, v] : kvs) {
-        newIndex[k] = buf;
-        buf = memcpyString(buf, k);
-        buf = memcpyString(buf, v);
+        pendingIndex[k] = pendingKvs;
+        pendingKvs = memcpyString(pendingKvs, k);
+        pendingKvs = memcpyString(pendingKvs, v);
     }
-
-    pendingHeader.head = slot + 1;
 
     return commitFuture;
 }
@@ -253,12 +253,21 @@ void Database::commitLoop(std::promise<void> commitPromise) {
         nextCommitPromise = std::promise<void>();
         commitFuture = nextCommitPromise.get_future();
 
-        auto temp = pendingIndex;
         updateIndex(pendingIndex);
-        pendingIndex = std::move(temp);
-
         *lh = pendingHeader;
+        resetPending();
+
     }
+}
+
+void Database::resetPending() {
+    pendingIndex = *getIndex();
+    LogHeader* lh = getLogHeader();
+    pendingHeader = *lh;
+    pendingHeader.head++;
+    pendingLogSlot = getLogSlot(lh->head);
+    pendingLogSlot->numKvs = 0;
+    pendingKvs = pendingLogSlot->kvs;
 }
 
 LogHeader* Database::getLogHeader() const {

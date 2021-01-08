@@ -4,20 +4,7 @@
 #include <string>
 
 #include "database.h"
-
-#ifndef NDEBUG
-#   define ASSERT_EQ(v1, v2) \
-    do { \
-        if (v1 != v2) { \
-            std::cerr << "Equality assertion failed in " << __FILE__ << " line " << __LINE__ << ": " \
-                      << #v1 << " (" << v1 << ")" << " != " \
-                      << #v2 << " (" << v2 << ")" << std::endl; \
-            std::terminate(); \
-        } \
-    } while (false)
-#else
-#   define ASSERT_EQ(v1, v2) do { } while (false)
-#endif
+#include "util.h"
 
 static std::optional<Value> readAndExpect(ReadFn readKey, const Key& key,
                           const std::optional<Value>& expected) {
@@ -78,7 +65,31 @@ static void test2() {
     }
 }
 
+static void test3() {
+    std::cout << "Starting test 3" << std::endl;
+    Database db("test_db.db", true);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 1024; ++i) {
+        threads.push_back(
+            std::thread([&db, i](){
+                for (int j = 0; j < 128; ++j) {
+                    db.performTransaction([i, j](ReadFn readKey, WriteFn writeKey) {
+                        auto v =  i == 0 ? readKey(std::to_string(i) + "0") : "Blah";
+                        writeKey(std::to_string(i) + std::to_string(j), v.value_or("None"));
+                        return true;
+                    });
+                }
+            })
+        );
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
 int main() {
     test1();
     test2();
+    test3();
 }

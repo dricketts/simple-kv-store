@@ -106,11 +106,13 @@ private:
 
     LogHeader* getLogHeader() const;
     LogSlot* getLogSlot(long n) const;
-    std::shared_future<void> append(const std::map<Key, Value>& kvs, Index& newIndex);
+    std::shared_future<void> append(const std::map<Key, Value>& kvs);
     void commitLoop(std::promise<void> commitPromise);
 
     std::shared_ptr<Index> getIndex();
     void updateIndex(const Index& newIndex);
+
+    void resetPending();
 
     std::tuple<Key, Value, LogPointer> getKV(const LogPointer lp) const;
 
@@ -120,8 +122,11 @@ private:
 
     std::mutex commitMutex;
     std::shared_ptr<Index> latestIndex;
+
     Index pendingIndex;
     LogHeader pendingHeader;
+    LogSlot* pendingLogSlot;
+    char* pendingKvs;
 
     std::promise<void> cancelPromise;
     std::shared_future<void> cancelFuture;

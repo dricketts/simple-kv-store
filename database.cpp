@@ -9,6 +9,7 @@
 #include "util.h"
 #include "serdes.h"
 
+// TODO: make all of these magic numbers configurable.
 static const long INT_SIZE = sizeof(int);
 static const long MAX_NUM_KV_PAIRS = 64;
 static const long MAX_KEY_SIZE = 1024;
@@ -134,14 +135,13 @@ void Database::write(const Key& key, const Value& value, TransactionMD& txnMD) c
 }
 
 TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txnMD) {
-    // For simplicitly do all of this in a critical section.
-    //   1. conflict checking - just look at the latest tree or whatever data structure
-    //   2. Append log entry
-    //   3. Fsync
-    //   4. Update log header
-    //   5. Fsync (possibly piggyback this on fsync for next transaction)
-    //   6. Update index
-    // There might be ways to increase concurrency here.
+    //   1. Acquire commit mutex
+    //   2. Wait for space in pending log slot
+    //   3. check for conflicts
+    //   4. append to pending log slot
+    //   5. unlock commit mutex
+    //   6. wait for commit thread to persist pending log slot and
+    //      corresponding header
     std::unique_lock lock(commitMutex);
     commitCond.wait(lock, [this, &txnMD] {
         return txnMD.writeSize <= pendingSpace();
@@ -180,16 +180,30 @@ size_t Database::pendingSpace() {
     return LOG_SLOT_PAYLOAD_SIZE - used;
 }
 
+// This function pipelines calls to persist() so that there is amortized one
+// call per log slot. A single call to persist() is used to persist the values
+// written to log slot N and the header pointing to N - 1. Effectively, a
+// committing transaction enters a two stage pipeline: stage 1 persists the log
+// slot and stage 2 persists the header pointing to that log slot.
+//
+// The input promise corresponds to commitFuture.
 void Database::commitLoop(std::promise<void> commitPromise) {
     LogHeader* lh = getLogHeader();
     
+    // There will never be any references to the future for the initial
+    // value of currentCommitPromise. This is because currentCommitPromise
+    // is for transactions in stage 2 of the pipeline, and there are initially
+    // no transactions in stage 2.
     std::promise<void> currentCommitPromise;
+    // nextCommitPromise is for transactions in stage 1 of the commit pipeline.
     std::promise<void> nextCommitPromise = std::move(commitPromise);
 
     while (cancelFuture.wait_for(std::chrono::milliseconds(10)) ==
-            std::future_status::timeout) {
+            std::future_status::timeout)
+    {
         std::scoped_lock lock(commitMutex);
         persist();
+        // Notify transactions that just completed stage 2.
         currentCommitPromise.set_value();
         currentCommitPromise = std::move(nextCommitPromise);
         nextCommitPromise = std::promise<void>();

@@ -88,6 +88,8 @@ static void test3() {
     }
 }
 
+// TODO: test larger transactions, larger keys, values
+
 int main() {
     test1();
     test2();

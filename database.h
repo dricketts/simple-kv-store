@@ -77,7 +77,18 @@ enum class TransactionResult {
 
 class Database {
 public:
+    /*
+     * Performs all initialization of the database and throws exceptions as
+     * needed. There is no need to separately initialize or open the database.
+     *
+     * If doFormat is set, this will potentially create the file and delete any
+     * existing data, initializing an empty store.
+     */
     Database(const std::string& fileName, bool doFormat);
+    /*
+     * Performs all necessary cleanup of the database. There is no need to
+     * separately close the database.
+     */
     ~Database();
 
     /*
@@ -89,24 +100,52 @@ public:
     TransactionResult performTransaction(Transaction txn);
 
 private:
-    struct TransactionMD;
 
+    struct TransactionMD;
     TransactionMD beginTransaction();
     const std::optional<Value> read(const Key& key, TransactionMD& txnMD) const;
     void write(const Key& key, const Value& value, TransactionMD& txnMD) const;
     TransactionResult tryCommit(bool wantsCommit, const TransactionMD& txnMD);
     bool checkConflicts(const TransactionMD& txnMD) const;
 
+    /*
+     * Called if doFormat is set in the constructor.
+     */
     void format();
+    /*
+     * Replay the log. Necessary at startup.
+     */
     void replay();
+    /*
+     * Writes the current contents of the logFile to stable storage.
+     */
     void persist();
 
+    // Pointer into the logFile.
     using LogPointer = char*;
     using Index = std::map<Key, LogPointer>;
 
+    /*
+     * Pointer to the fixed-location log header in the logFile.
+     */
     LogHeader* getLogHeader() const;
+    /*
+     * Gets a pointer to the log slot corresponding to the logical log slot n.
+     * The logFile holds a circular log, so more than one logical log slot uses
+     * the same LogSlot*.
+     */
     LogSlot* getLogSlot(long n) const;
+    /*
+     * Append the key-values pairs to the log. This returns a future to signal
+     * when the appending pairs are durable.
+     *
+     * This function must only be called while holding commitMutex.
+     */
     std::shared_future<void> append(const std::map<Key, Value>& kvs);
+    /*
+     * Run by a background thread to make key-value pairs durable. Sets
+     * promises corresponding to futures returned by append().
+     */
     void commitLoop(std::promise<void> commitPromise);
 
     std::shared_ptr<Index> getIndex();
@@ -116,23 +155,41 @@ private:
      * Returns the space remaining in the current pending log slot.
      */
     size_t pendingSpace();
+    /*
+     * Resets the pending log slot and corresponding state to point to the
+     * an unused log slot after the current log head.
+     */
     void resetPending();
 
+    // Fixed-size memory mapped file storing log slots and the log header.
     MemoryMappedFile logFile;
 
+    // Protects access to the tip of the log.
     std::mutex commitMutex;
+    // Used to signal available space in the pending log slot.
     std::condition_variable commitCond;
 
+    // Latest index into the log. Should only be accessed with getIndex() and
+    // updateIndex().
     std::shared_ptr<Index> latestIndex;
 
+    // State corresponding to the log slot available for writing new key-value
+    // pairs. The critical section of commitLoop() maintains the invariant that
+    // getLogHeader() points to the previous slot and that commitFuture
+    // signals completion of writes going to pendingLogSlot. These structures
+    // must only be accessed under commitMutex.
     Index pendingIndex;
     LogHeader pendingHeader;
     LogSlot* pendingLogSlot;
     char* pendingKvs;
 
+    // Promise/future pair used to signal cancellation to background thread(s).
     std::promise<void> cancelPromise;
     std::shared_future<void> cancelFuture;
     
+    // Future used to signal persistence of key-value pairs written to
+    // pendingLogSlot.
     std::shared_future<void> commitFuture;
+    // Background thread that runs commitLoop().
     std::thread commitThread;
 };

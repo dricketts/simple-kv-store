@@ -4,6 +4,7 @@
 #include <queue>
 #include <functional>
 #include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <cassert>
 #include <thread>
@@ -92,7 +93,7 @@ private:
 
     TransactionMD beginTransaction();
     const std::optional<Value> read(const Key& key, TransactionMD& txnMD) const;
-    void write(const Key& key, const Value& value, std::map<Key, Value>& writes) const;
+    void write(const Key& key, const Value& value, TransactionMD& txnMD) const;
     TransactionResult tryCommit(bool wantsCommit, const TransactionMD& txnMD);
     bool checkConflicts(const TransactionMD& txnMD) const;
 
@@ -111,13 +112,17 @@ private:
     std::shared_ptr<Index> getIndex();
     void updateIndex(const Index& newIndex);
 
+    /*
+     * Returns the space remaining in the current pending log slot.
+     */
+    size_t pendingSpace();
     void resetPending();
-
-    std::tuple<Key, Value, LogPointer> getKV(const LogPointer lp) const;
 
     MemoryMappedFile logFile;
 
     std::mutex commitMutex;
+    std::condition_variable commitCond;
+
     std::shared_ptr<Index> latestIndex;
 
     Index pendingIndex;

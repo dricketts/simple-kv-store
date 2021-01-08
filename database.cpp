@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "util.h"
+#include "serdes.h"
 
 static const long INT_SIZE = sizeof(int);
 static const long MAX_NUM_KV_PAIRS = 64;
@@ -87,6 +88,7 @@ void Database::persist() {
 struct Database::TransactionMD {
     std::shared_ptr<Index> readIndex;
     std::map<Key, Value> writes;
+    size_t writeSize = 0;
     std::unordered_set<Key> readSet;
 };
 
@@ -98,7 +100,7 @@ TransactionResult Database::performTransaction(Transaction txn) {
         return read(key, txnMD);
     };
     auto txnWrite = [this, &txnMD](const Key& key, const Value& value) {
-        write(key, value, txnMD.writes);
+        write(key, value, txnMD);
     };
     bool wantsCommit = txn(txnRead, txnWrite);
     return tryCommit(wantsCommit, txnMD);
@@ -107,16 +109,6 @@ TransactionResult Database::performTransaction(Transaction txn) {
 // TODO: concurrency control for log trimming
 Database::TransactionMD Database::beginTransaction() {
     return {.readIndex = getIndex()};
-}
-
-std::tuple<Key, Value, Database::LogPointer> Database::getKV(const LogPointer lp) const {
-    size_t ksize = *lp;
-    char* kp = lp + sizeof(size_t);
-    const Key key {kp, ksize};
-    size_t vsize = *(kp + ksize);
-    char* vp = kp + ksize + sizeof(size_t);
-    const Value value {vp, vsize};
-    return {key, value, vp + vsize};
 }
 
 const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) const {
@@ -135,9 +127,10 @@ const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) 
     return v;
 }
 
-void Database::write(const Key& key, const Value& value, std::map<Key, Value>& writes) const {
+void Database::write(const Key& key, const Value& value, TransactionMD& txnMD) const {
     // TODO: does move make any sense here?
-    writes[key] = std::move(value);
+    txnMD.writes[key] = std::move(value);
+    txnMD.writeSize += kvSerializedSize(key, value);
 }
 
 TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txnMD) {
@@ -150,6 +143,9 @@ TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txn
     //   6. Update index
     // There might be ways to increase concurrency here.
     std::unique_lock lock(commitMutex);
+    commitCond.wait(lock, [this, &txnMD] {
+        return txnMD.writeSize <= pendingSpace();
+    });
 
     // Step 1
     if (!checkConflicts(txnMD)) return TransactionResult::Conflict;
@@ -167,26 +163,21 @@ bool Database::checkConflicts(const TransactionMD& txnMD) const {
     return true;
 }
 
-static char* memcpyString(char* dest, const std::string& str) {
-    size_t sz = str.size();
-    std::memcpy(dest, &sz, sizeof(size_t));
-    dest += sizeof(size_t);
-    std::memcpy(dest, str.c_str(), sz);
-    dest += sz;
-    return dest;
-}
-
 // Precondition: thread holds commitMutex
 std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
     
     pendingLogSlot->numKvs += kvs.size();
     for (auto& [k, v] : kvs) {
         pendingIndex[k] = pendingKvs;
-        pendingKvs = memcpyString(pendingKvs, k);
-        pendingKvs = memcpyString(pendingKvs, v);
+        pendingKvs = memcpyKV(pendingKvs, k, v);
     }
 
     return commitFuture;
+}
+
+size_t Database::pendingSpace() {
+    size_t used = pendingKvs - pendingLogSlot->kvs;
+    return LOG_SLOT_PAYLOAD_SIZE - used;
 }
 
 void Database::commitLoop(std::promise<void> commitPromise) {
@@ -207,6 +198,7 @@ void Database::commitLoop(std::promise<void> commitPromise) {
         updateIndex(pendingIndex);
         *lh = pendingHeader;
         resetPending();
+        commitCond.notify_one();
 
     }
 }

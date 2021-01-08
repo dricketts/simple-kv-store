@@ -1,3 +1,5 @@
+#include <iostream>
+
 #ifndef NDEBUG
 #   define ASSERT_EQ(v1, v2) \
     do { \

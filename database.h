@@ -9,6 +9,8 @@
 #include <thread>
 #include <future>
 
+#include "memory_mapped_file.h"
+
 /*
  * This class implements a transactional key-value store with an extremely
  * simple API:
@@ -94,11 +96,8 @@ private:
     TransactionResult tryCommit(bool wantsCommit, const TransactionMD& txnMD);
     bool checkConflicts(const TransactionMD& txnMD) const;
 
-    // TODO: error codes/exceptions??
-    void openFile(const std::string& fileName, bool doFormat);
     void format();
     void replay();
-    void closeFile();
     void persist();
 
     using LogPointer = char*;
@@ -116,9 +115,7 @@ private:
 
     std::tuple<Key, Value, LogPointer> getKV(const LogPointer lp) const;
 
-    int fd;
-    char* fileMemory;
-    long fileSize;
+    MemoryMappedFile logFile;
 
     std::mutex commitMutex;
     std::shared_ptr<Index> latestIndex;

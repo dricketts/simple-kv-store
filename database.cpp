@@ -4,13 +4,7 @@
 #include <algorithm>
 #include <future>
 #include <iostream>
-
-// for mmap
 #include <mutex>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include "util.h"
 
@@ -46,8 +40,7 @@ static const long FILE_SIZE = LOG_HEADER_SIZE + NUM_LOG_SLOT * LOG_SLOT_SIZE;
 
 using Log = LogSlot[NUM_LOG_SLOT];
 
-Database::Database(const std::string& fileName, bool doFormat) {
-    openFile(fileName, doFormat);
+Database::Database(const std::string& fileName, bool doFormat) : logFile(fileName, FILE_SIZE) {
     if (doFormat) format();
     replay();
     
@@ -63,48 +56,12 @@ Database::Database(const std::string& fileName, bool doFormat) {
 Database::~Database() {
     cancelPromise.set_value();
     commitThread.join();
-
-    closeFile();
 }
 
 void Database::format() {
     LogHeader* lh = getLogHeader();
     lh->head = 0;
     persist();
-}
-
-static void handle_error(const char* msg) {
-    perror(msg); 
-    exit(255);
-}
-
-// TODO: open, close, and persist be implemented against a file
-void Database::openFile(const std::string& fileName, bool doFormat) {
-    // fileMemory = static_cast<char*>(::operator new(FILE_SIZE));
-    // fileSize = FILE_SIZE;
-    fd = open(fileName.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    if (fd == -1)
-        handle_error("open");
-
-    // obtain file size
-    struct stat sb;
-    if (fstat(fd, &sb) == -1)
-        handle_error("fstat");
-
-    fileSize = sb.st_size;
-    if (fileSize != FILE_SIZE && !doFormat)
-        handle_error("file size");
-    
-    if (doFormat) {
-        if (ftruncate(fd, FILE_SIZE) == -1) {
-            handle_error("truncate");
-        };
-        fileSize = FILE_SIZE;
-    }
-    
-    fileMemory = static_cast<char*>(mmap(NULL, fileSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0u));
-    if (fileMemory == MAP_FAILED)
-        handle_error("mmap");
 }
 
 void Database::replay() {
@@ -123,14 +80,8 @@ void Database::replay() {
     latestIndex = std::make_shared<Index>(index);
 }
 
-void Database::closeFile() {
-    // ::operator delete(fileMemory);
-    munmap(fileMemory, fileSize);
-    close(fd);
-}
-
 void Database::persist() {
-    fsync(fd);
+    logFile.persist();
 }
 
 struct Database::TransactionMD {
@@ -271,11 +222,11 @@ void Database::resetPending() {
 }
 
 LogHeader* Database::getLogHeader() const {
-    return reinterpret_cast<LogHeader*>(fileMemory);
+    return reinterpret_cast<LogHeader*>(logFile.getBasePointer());
 }
 
 LogSlot* Database::getLogSlot(long n) const {
-    return reinterpret_cast<LogSlot*>(fileMemory + LOG_HEADER_SIZE) + (n % NUM_LOG_SLOT);
+    return reinterpret_cast<LogSlot*>(logFile.getBasePointer() + LOG_HEADER_SIZE) + (n % NUM_LOG_SLOT);
 }
 
 std::shared_ptr<Database::Index> Database::getIndex() {

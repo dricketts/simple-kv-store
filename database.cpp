@@ -42,22 +42,22 @@ static const long FILE_SIZE = LOG_HEADER_SIZE + NUM_LOG_SLOT * LOG_SLOT_SIZE;
 
 using Log = LogSlot[NUM_LOG_SLOT];
 
-Database::Database(const std::string& fileName, bool doFormat) : logFile(fileName, FILE_SIZE) {
+Database::Database(const std::string& fileName, bool doFormat) : logFile_(fileName, FILE_SIZE) {
     if (doFormat) format();
     replay();
     
     resetPending();
 
-    cancelFuture = cancelPromise.get_future();
+    cancelFuture_ = cancelPromise_.get_future();
 
     std::promise<void> commitPromise;
-    commitFuture = commitPromise.get_future();
-    commitThread = std::thread(&Database::commitLoop, this, std::move(commitPromise));
+    commitFuture_ = commitPromise.get_future();
+    commitThread_ = std::thread(&Database::commitLoop, this, std::move(commitPromise));
 }
 
 Database::~Database() {
-    cancelPromise.set_value();
-    commitThread.join();
+    cancelPromise_.set_value();
+    commitThread_.join();
 }
 
 void Database::format() {
@@ -79,11 +79,11 @@ void Database::replay() {
         }
     }
 
-    latestIndex = std::make_shared<Index>(index);
+    latestIndex_ = std::make_shared<Index>(index);
 }
 
 void Database::persist() {
-    logFile.persist();
+    logFile_.persist();
 }
 
 struct Database::TransactionMD {
@@ -142,15 +142,13 @@ TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txn
     //   5. unlock commit mutex
     //   6. wait for commit thread to persist pending log slot and
     //      corresponding header
-    std::unique_lock lock(commitMutex);
-    commitCond.wait(lock, [this, &txnMD] {
+    std::unique_lock lock(commitMutex_);
+    commitCond_.wait(lock, [this, &txnMD] {
         return txnMD.writeSize <= pendingSpace();
     });
 
-    // Step 1
     if (!checkConflicts(txnMD)) return TransactionResult::Conflict;
 
-    // Step 2-6
     auto commitFuture = append(txnMD.writes);
     lock.unlock();
 
@@ -166,17 +164,17 @@ bool Database::checkConflicts(const TransactionMD& txnMD) const {
 // Precondition: thread holds commitMutex
 std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
     
-    pendingLogSlot->numKvs += kvs.size();
+    pendingLogSlot_->numKvs += kvs.size();
     for (auto& [k, v] : kvs) {
-        pendingIndex[k] = pendingKvs;
-        pendingKvs = memcpyKV(pendingKvs, k, v);
+        pendingIndex_[k] = pendingKvs_;
+        pendingKvs_ = memcpyKV(pendingKvs_, k, v);
     }
 
-    return commitFuture;
+    return commitFuture_;
 }
 
 size_t Database::pendingSpace() {
-    size_t used = pendingKvs - pendingLogSlot->kvs;
+    size_t used = pendingKvs_ - pendingLogSlot_->kvs;
     return LOG_SLOT_PAYLOAD_SIZE - used;
 }
 
@@ -190,55 +188,54 @@ size_t Database::pendingSpace() {
 void Database::commitLoop(std::promise<void> commitPromise) {
     LogHeader* lh = getLogHeader();
     
-    // There will never be any references to the future for the initial
-    // value of currentCommitPromise. This is because currentCommitPromise
-    // is for transactions in stage 2 of the pipeline, and there are initially
-    // no transactions in stage 2.
-    std::promise<void> currentCommitPromise;
-    // nextCommitPromise is for transactions in stage 1 of the commit pipeline.
-    std::promise<void> nextCommitPromise = std::move(commitPromise);
+    // There will never be any references to the future for the initial value of
+    // stage2Promise. This is because stage2Promise is for transactions in stage
+    // 2 of the pipeline, and there are initially no no transactions in stage 2.
+    std::promise<void> stage2Promise;
+    // stage1Promise is for transactions in stage 1 of the commit pipeline.
+    std::promise<void> stage1Promise = std::move(commitPromise);
 
-    while (cancelFuture.wait_for(std::chrono::milliseconds(10)) ==
+    while (cancelFuture_.wait_for(std::chrono::milliseconds(10)) ==
             std::future_status::timeout)
     {
-        std::scoped_lock lock(commitMutex);
+        std::scoped_lock lock(commitMutex_);
         persist();
         // Notify transactions that just completed stage 2.
-        currentCommitPromise.set_value();
-        currentCommitPromise = std::move(nextCommitPromise);
-        nextCommitPromise = std::promise<void>();
-        commitFuture = nextCommitPromise.get_future();
+        stage2Promise.set_value();
+        stage2Promise = std::move(stage1Promise);
+        stage1Promise = std::promise<void>();
+        commitFuture_ = stage1Promise.get_future();
 
-        updateIndex(pendingIndex);
-        *lh = pendingHeader;
+        updateIndex(pendingIndex_);
+        *lh = pendingHeader_;
         resetPending();
-        commitCond.notify_one();
+        commitCond_.notify_one();
 
     }
 }
 
 void Database::resetPending() {
-    pendingIndex = *getIndex();
+    pendingIndex_ = *getIndex();
     LogHeader* lh = getLogHeader();
-    pendingHeader = *lh;
-    pendingHeader.head++;
-    pendingLogSlot = getLogSlot(lh->head);
-    pendingLogSlot->numKvs = 0;
-    pendingKvs = pendingLogSlot->kvs;
+    pendingHeader_ = *lh;
+    pendingHeader_.head++;
+    pendingLogSlot_ = getLogSlot(lh->head);
+    pendingLogSlot_->numKvs = 0;
+    pendingKvs_ = pendingLogSlot_->kvs;
 }
 
 LogHeader* Database::getLogHeader() const {
-    return reinterpret_cast<LogHeader*>(logFile.getBasePointer());
+    return reinterpret_cast<LogHeader*>(logFile_.getBasePointer());
 }
 
 LogSlot* Database::getLogSlot(long n) const {
-    return reinterpret_cast<LogSlot*>(logFile.getBasePointer() + LOG_HEADER_SIZE) + (n % NUM_LOG_SLOT);
+    return reinterpret_cast<LogSlot*>(logFile_.getBasePointer() + LOG_HEADER_SIZE) + (n % NUM_LOG_SLOT);
 }
 
 std::shared_ptr<Database::Index> Database::getIndex() {
-    return std::atomic_load(&latestIndex);
+    return std::atomic_load(&latestIndex_);
 }
 
 void Database::updateIndex(const Index& newIndex) {
-    std::atomic_store(&latestIndex, std::make_shared<Index>(newIndex));
+    std::atomic_store(&latestIndex_, std::make_shared<Index>(newIndex));
 }

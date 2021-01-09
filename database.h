@@ -162,34 +162,34 @@ private:
     void resetPending();
 
     // Fixed-size memory mapped file storing log slots and the log header.
-    MemoryMappedFile logFile;
+    MemoryMappedFile logFile_;
 
     // Protects access to the tip of the log.
-    std::mutex commitMutex;
+    std::mutex commitMutex_;
     // Used to signal available space in the pending log slot.
-    std::condition_variable commitCond;
+    std::condition_variable commitCond_;
 
     // Latest index into the log. Should only be accessed with getIndex() and
     // updateIndex().
-    std::shared_ptr<Index> latestIndex;
+    std::shared_ptr<Index> latestIndex_;
 
     // State corresponding to the log slot available for writing new key-value
     // pairs. The critical section of commitLoop() maintains the invariant that
     // getLogHeader() points to the previous slot and that commitFuture
     // signals completion of writes going to pendingLogSlot. These structures
     // must only be accessed under commitMutex.
-    Index pendingIndex;
-    LogHeader pendingHeader;
-    LogSlot* pendingLogSlot;
-    char* pendingKvs;
+    Index pendingIndex_;
+    LogHeader pendingHeader_;
+    LogSlot* pendingLogSlot_;
+    char* pendingKvs_;
 
     // Promise/future pair used to signal cancellation to background thread(s).
-    std::promise<void> cancelPromise;
-    std::shared_future<void> cancelFuture;
+    std::promise<void> cancelPromise_;
+    std::shared_future<void> cancelFuture_;
     
     // Future used to signal persistence of key-value pairs written to
     // pendingLogSlot.
-    std::shared_future<void> commitFuture;
+    std::shared_future<void> commitFuture_;
     // Background thread that runs commitLoop().
-    std::thread commitThread;
+    std::thread commitThread_;
 };

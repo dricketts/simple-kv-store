@@ -122,7 +122,10 @@ private:
     void persist();
 
     // Pointer into the logFile.
-    using LogPointer = char*;
+    struct LogPointer {
+        long slot;
+        long offset;
+    };
     using Index = std::map<Key, LogPointer>;
 
     /*
@@ -180,8 +183,7 @@ private:
     // must only be accessed under commitMutex.
     Index pendingIndex_;
     LogHeader pendingHeader_;
-    LogSlot* pendingLogSlot_;
-    char* pendingKvs_;
+    LogPointer pendingLogP_;
 
     // Promise/future pair used to signal cancellation to background thread(s).
     std::promise<void> cancelPromise_;

@@ -71,11 +71,11 @@ void Database::replay() {
     const LogHeader* lh = getLogHeader();
     for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT_REPLAY); slot < lh->head; ++slot) {
         LogSlot* ls = getLogSlot(slot);
-        LogPointer lp = ls->kvs;
+        char* kvsp = ls->kvs;
         for (int i = 0; i < ls->numKvs; ++i) {
-            auto [k, _, newLp] = getKV(lp);
-            index[k] = lp;
-            lp = newLp;
+            auto [k, _, newKvsp] = getKV(kvsp);
+            index[k] = {slot, ls->kvs - kvsp};
+            kvsp = newKvsp;
         }
     }
 
@@ -123,7 +123,8 @@ const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) 
     // Read from the index
     auto it = txnMD.readIndex.get()->find(key);
     if (it == txnMD.readIndex.get()->end()) return {};
-    auto [k, v, _] = getKV(it->second);
+    auto [slot, offset] = it->second;
+    auto [k, v, _] = getKV(getLogSlot(slot)->kvs + offset);
     ASSERT_EQ(k, key);
     return v;
 }
@@ -163,19 +164,19 @@ bool Database::checkConflicts(const TransactionMD& txnMD) const {
 
 // Precondition: thread holds commitMutex
 std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
-    
-    pendingLogSlot_->numKvs += kvs.size();
+    LogSlot* ls = getLogSlot(pendingLogP_.slot);
+    ls->numKvs += kvs.size();
     for (auto& [k, v] : kvs) {
-        pendingIndex_[k] = pendingKvs_;
-        pendingKvs_ = memcpyKV(pendingKvs_, k, v);
+        pendingIndex_[k] = pendingLogP_;
+        char* newOff = memcpyKV(ls->kvs + pendingLogP_.offset, k, v);
+        pendingLogP_.offset = newOff - ls->kvs;
     }
 
     return commitFuture_;
 }
 
 size_t Database::pendingSpace() {
-    size_t used = pendingKvs_ - pendingLogSlot_->kvs;
-    return LOG_SLOT_PAYLOAD_SIZE - used;
+    return LOG_SLOT_PAYLOAD_SIZE - pendingLogP_.offset;
 }
 
 // This function pipelines calls to persist() so that there is amortized one
@@ -219,9 +220,8 @@ void Database::resetPending() {
     LogHeader* lh = getLogHeader();
     pendingHeader_ = *lh;
     pendingHeader_.head++;
-    pendingLogSlot_ = getLogSlot(lh->head);
-    pendingLogSlot_->numKvs = 0;
-    pendingKvs_ = pendingLogSlot_->kvs;
+    pendingLogP_ = {lh->head, 0};
+    getLogSlot(lh->head)->numKvs = 0;
 }
 
 LogHeader* Database::getLogHeader() const {

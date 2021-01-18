@@ -4,6 +4,7 @@
 #include <queue>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 #include <memory>
 #include <cassert>
@@ -103,7 +104,11 @@ private:
 
     struct TransactionMD;
     TransactionMD beginTransaction();
-    const std::optional<Value> read(const Key& key, TransactionMD& txnMD) const;
+    /*
+     * Note: read cannot be a const function because the implementation acquires
+     * a shared lock.
+     */
+    const std::optional<Value> read(const Key& key, TransactionMD& txnMD);
     void write(const Key& key, const Value& value, TransactionMD& txnMD) const;
     TransactionResult tryCommit(bool wantsCommit, const TransactionMD& txnMD);
     bool checkConflicts(const TransactionMD& txnMD) const;
@@ -138,6 +143,11 @@ private:
      * the same LogSlot*.
      */
     LogSlot* getLogSlot(long n) const;
+    /*
+     * Returns the logFile_ slot number corresponding to the given logical log
+     * slot.
+     */
+    long getPhysicalLogSlot(long slot) const;
     /*
      * Append the key-values pairs to the log. This returns a future to signal
      * when the appending pairs are durable.
@@ -194,4 +204,13 @@ private:
     std::shared_future<void> commitFuture_;
     // Background thread that runs commitLoop().
     std::thread commitThread_;
+
+    void updateSlotAndExec(long slot, std::function<void ()> exec);
+    bool checkSlotAndExec(long slot, std::function<void ()> exec);
+
+    struct SlotRWMutex {
+        long slot;
+        std::shared_mutex mutex;
+    };
+    std::vector<SlotRWMutex> slotRWMutexes_;
 };

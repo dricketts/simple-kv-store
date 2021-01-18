@@ -8,8 +8,10 @@
 
 #include "util.h"
 #include "serdes.h"
+#include "exceptions.h"
 
 // TODO: make all of these magic numbers configurable.
+
 static const long INT_SIZE = sizeof(int);
 static const long MAX_NUM_KV_PAIRS = 64;
 static const long MAX_KEY_SIZE = 1024;
@@ -42,7 +44,10 @@ static const long FILE_SIZE = LOG_HEADER_SIZE + NUM_LOG_SLOT * LOG_SLOT_SIZE;
 
 using Log = LogSlot[NUM_LOG_SLOT];
 
-Database::Database(const std::string& fileName, bool doFormat) : logFile_(fileName, FILE_SIZE) {
+Database::Database(const std::string& fileName, bool doFormat) :
+    logFile_(fileName, FILE_SIZE),
+    slotRWMutexes_(NUM_LOG_SLOT)
+{
     if (doFormat) format();
     replay();
     
@@ -71,6 +76,7 @@ void Database::replay() {
     const LogHeader* lh = getLogHeader();
     for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT_REPLAY); slot < lh->head; ++slot) {
         LogSlot* ls = getLogSlot(slot);
+        updateSlotAndExec(slot, [](){});
         char* kvsp = ls->kvs;
         for (int i = 0; i < ls->numKvs; ++i) {
             auto [k, _, newKvsp] = getKV(kvsp);
@@ -112,7 +118,7 @@ Database::TransactionMD Database::beginTransaction() {
     return {.readIndex = getIndex()};
 }
 
-const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) const {
+const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) {
     txnMD.readSet.insert(key);
 
     // Try to read from local writes
@@ -124,9 +130,19 @@ const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) 
     auto it = txnMD.readIndex.get()->find(key);
     if (it == txnMD.readIndex.get()->end()) return {};
     auto [slot, offset] = it->second;
-    auto [k, v, _] = getKV(getLogSlot(slot)->kvs + offset);
-    ASSERT_EQ(k, key);
-    return v;
+    char* kvp = getLogSlot(slot)->kvs + offset;
+    Key k; Value v;
+    bool success = checkSlotAndExec(slot, [this, &k, &v, kvp](){
+        auto [kk, vv, _] = getKV(kvp);
+        k = std::move(kk);
+        v = std::move(vv);
+    });
+    if (success) {
+        ASSERT_EQ(k, key);
+        return v;
+    } else {
+        throw StaleRead(slot);
+    }
 }
 
 void Database::write(const Key& key, const Value& value, TransactionMD& txnMD) const {
@@ -164,13 +180,15 @@ bool Database::checkConflicts(const TransactionMD& txnMD) const {
 
 // Precondition: thread holds commitMutex
 std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
-    LogSlot* ls = getLogSlot(pendingLogP_.slot);
-    ls->numKvs += kvs.size();
-    for (auto& [k, v] : kvs) {
-        pendingIndex_[k] = pendingLogP_;
-        char* newOff = memcpyKV(ls->kvs + pendingLogP_.offset, k, v);
-        pendingLogP_.offset = newOff - ls->kvs;
-    }
+    updateSlotAndExec(pendingLogP_.slot, [this, &kvs](){
+        LogSlot* ls = getLogSlot(pendingLogP_.slot);
+        ls->numKvs += kvs.size();
+        for (auto& [k, v] : kvs) {
+            pendingIndex_[k] = pendingLogP_;
+            char* newOff = memcpyKV(ls->kvs + pendingLogP_.offset, k, v);
+            pendingLogP_.offset = newOff - ls->kvs;
+        } 
+    });
 
     return commitFuture_;
 }
@@ -224,12 +242,38 @@ void Database::resetPending() {
     getLogSlot(lh->head)->numKvs = 0;
 }
 
+void Database::updateSlotAndExec(long slot, std::function<void ()> exec) {
+    SlotRWMutex& srw = slotRWMutexes_[getPhysicalLogSlot(slot)];
+    std::scoped_lock lock(srw.mutex);
+    srw.slot = slot;
+    exec();
+}
+
+bool Database::checkSlotAndExec(long slot, std::function<void ()> exec) {
+    SlotRWMutex& srw = slotRWMutexes_[getPhysicalLogSlot(slot)];
+    // TODO: try_to_lock?
+    // no point on blocking if the lock is held in exclusive mode
+    // but, try_to_lock might introduce spurious failures
+    // on the other hand, spurious failures are good for testing
+    std::shared_lock lock(srw.mutex);
+    if (srw.slot == slot) {
+        exec();
+        return true;
+    } else {
+        return false;
+    }
+}
+
 LogHeader* Database::getLogHeader() const {
     return reinterpret_cast<LogHeader*>(logFile_.getBasePointer());
 }
 
+long Database::getPhysicalLogSlot(long n) const {
+    return n % NUM_LOG_SLOT;
+}
+
 LogSlot* Database::getLogSlot(long n) const {
-    return reinterpret_cast<LogSlot*>(logFile_.getBasePointer() + LOG_HEADER_SIZE) + (n % NUM_LOG_SLOT);
+    return reinterpret_cast<LogSlot*>(logFile_.getBasePointer() + LOG_HEADER_SIZE) + getPhysicalLogSlot(n);
 }
 
 std::shared_ptr<Database::Index> Database::getIndex() {

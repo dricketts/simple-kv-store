@@ -30,14 +30,14 @@ static char* memcpyKV(char* dest, const std::string& key, const std::string& val
     return end;
 }
 
-static std::tuple<std::string, std::string, char*> getKV(char* src) {
+static std::tuple<std::string, std::string, const char*> getKV(const char* src) {
     size_t ksize = *src;
-    char* kp = src + sizeof(size_t);
+    const char* kp = src + sizeof(size_t);
     const std::string key {kp, ksize};
     size_t vsize = *(kp + ksize);
-    char* vp = kp + ksize + sizeof(size_t);
+    const char* vp = kp + ksize + sizeof(size_t);
     const std::string value {vp, vsize};
-    char* end = vp + vsize;
+    const char* end = vp + vsize;
     ASSERT_EQ(end, src + kvSerializedSize(key, value));
     return {key, value, end};
 }

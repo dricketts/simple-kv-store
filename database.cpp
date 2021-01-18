@@ -75,14 +75,14 @@ void Database::replay() {
     Index index;
     const LogHeader* lh = getLogHeader();
     for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT_REPLAY); slot < lh->head; ++slot) {
-        LogSlot* ls = getLogSlot(slot);
-        updateSlotAndExec(slot, [](){});
-        char* kvsp = ls->kvs;
-        for (int i = 0; i < ls->numKvs; ++i) {
-            auto [k, _, newKvsp] = getKV(kvsp);
-            index[k] = {slot, ls->kvs - kvsp};
-            kvsp = newKvsp;
-        }
+        updateSlotAndExec(slot, [slot, &index](LogSlot* ls){
+            const char* kvsp = ls->kvs;
+            for (int i = 0; i < ls->numKvs; ++i) {
+                auto [k, _, newKvsp] = getKV(kvsp);
+                index[k] = {slot, ls->kvs - kvsp};
+                kvsp = newKvsp;
+            }
+        });
     }
 
     latestIndex_ = std::make_shared<Index>(index);
@@ -129,20 +129,18 @@ const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) 
     // Read from the index
     auto it = txnMD.readIndex.get()->find(key);
     if (it == txnMD.readIndex.get()->end()) return {};
-    auto [slot, offset] = it->second;
-    char* kvp = getLogSlot(slot)->kvs + offset;
+    // cannot use structured binding for slot and offset because offset is
+    // captured by the lambda below
+    long slot = it->second.slot;
+    long offset = it->second.offset;
     Key k; Value v;
-    bool success = checkSlotAndExec(slot, [this, &k, &v, kvp](){
-        auto [kk, vv, _] = getKV(kvp);
+    checkSlotAndExec(slot, [this, &k, &v, offset](const LogSlot* ls){
+        auto [kk, vv, _] = getKV(ls->kvs + offset);
         k = std::move(kk);
         v = std::move(vv);
     });
-    if (success) {
-        ASSERT_EQ(k, key);
-        return v;
-    } else {
-        throw StaleRead(slot);
-    }
+    ASSERT_EQ(k, key);
+    return v;
 }
 
 void Database::write(const Key& key, const Value& value, TransactionMD& txnMD) const {
@@ -180,8 +178,7 @@ bool Database::checkConflicts(const TransactionMD& txnMD) const {
 
 // Precondition: thread holds commitMutex
 std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
-    updateSlotAndExec(pendingLogP_.slot, [this, &kvs](){
-        LogSlot* ls = getLogSlot(pendingLogP_.slot);
+    updateSlotAndExec(pendingLogP_.slot, [this, &kvs](LogSlot* ls){
         ls->numKvs += kvs.size();
         for (auto& [k, v] : kvs) {
             pendingIndex_[k] = pendingLogP_;
@@ -239,17 +236,25 @@ void Database::resetPending() {
     pendingHeader_ = *lh;
     pendingHeader_.head++;
     pendingLogP_ = {lh->head, 0};
-    getLogSlot(lh->head)->numKvs = 0;
+    updateSlotAndExec(lh->head, [](LogSlot* ls){
+        ls->numKvs = 0;
+    });
 }
 
-void Database::updateSlotAndExec(long slot, std::function<void ()> exec) {
+void Database::updateSlotAndExec(long slot, std::function<void (LogSlot*)> exec) {
     SlotRWMutex& srw = slotRWMutexes_[getPhysicalLogSlot(slot)];
     std::scoped_lock lock(srw.mutex);
-    srw.slot = slot;
-    exec();
+    // TODO: check slot for non-decreasing
+    // throw exception or return bool??
+    if (srw.slot <= slot) {
+        srw.slot = slot;
+        exec(getLogSlot(slot));
+    } else {
+        throw InvalidSlotWrite(slot);
+    }
 }
 
-bool Database::checkSlotAndExec(long slot, std::function<void ()> exec) {
+void Database::checkSlotAndExec(long slot, std::function<void (const LogSlot*)> exec) {
     SlotRWMutex& srw = slotRWMutexes_[getPhysicalLogSlot(slot)];
     // TODO: try_to_lock?
     // no point on blocking if the lock is held in exclusive mode
@@ -257,10 +262,10 @@ bool Database::checkSlotAndExec(long slot, std::function<void ()> exec) {
     // on the other hand, spurious failures are good for testing
     std::shared_lock lock(srw.mutex);
     if (srw.slot == slot) {
-        exec();
-        return true;
+        const LogSlot* ls = getLogSlot(slot);
+        exec(ls);
     } else {
-        return false;
+        throw StaleSlotRead(slot);
     }
 }
 

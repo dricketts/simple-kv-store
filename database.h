@@ -141,6 +141,10 @@ private:
      * Gets a pointer to the log slot corresponding to the logical log slot n.
      * The logFile holds a circular log, so more than one logical log slot uses
      * the same LogSlot*.
+     *
+     * Note: this is not thread safe and should not be called directly. Instead,
+     * use checkSlotAndExec and updateSlotAndExec to read and write,
+     * respectively.
      */
     LogSlot* getLogSlot(long n) const;
     /*
@@ -205,9 +209,28 @@ private:
     // Background thread that runs commitLoop().
     std::thread commitThread_;
 
-    void updateSlotAndExec(long slot, std::function<void ()> exec);
-    bool checkSlotAndExec(long slot, std::function<void ()> exec);
+    /*
+     * Attempts to call exec on the desired logical log slot. Does so under an
+     * exclusive lock on that slot, only if slot is greater than or equal to the
+     * current logical slot. Also updates the current logical slot to the given
+     * slot.
+     *
+     * If slot is less than the current logical slot, this function throws an
+     * InvalidSlotWrite exception.
+     */
+    void updateSlotAndExec(long slot, std::function<void (LogSlot*)> exec);
+    /*
+     * Attempts to call exec on the desired logical log slot. Does so under a
+     * shared lock on that slot, only if slot is equal to the current logical
+     * slot.
+     *
+     * If slot is not equal to the current logical slot, this function throws an
+     * StaleSlotRead exception.
+     */
+    void checkSlotAndExec(long slot, std::function<void (const LogSlot*)> exec);
 
+    // slotRWMutexes_ are used to provide thread-safe access to log slots in the
+    // functions updateSlotAndExec and checkSlotAndExec.
     struct SlotRWMutex {
         long slot;
         std::shared_mutex mutex;

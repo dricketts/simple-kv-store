@@ -67,7 +67,6 @@ struct LogHeader {
     // Next logical log slot to be appended.
     long head;
 };
-struct LogSlot;
 
 // TODO: add more information to transaction result
 enum class TransactionResult {
@@ -76,6 +75,11 @@ enum class TransactionResult {
     Other,
 };
 
+template <
+    long LOG_SLOT_PAYLOAD_SIZE,
+    // Number of consecutive log slots required to replay the state machine
+    long NUM_LOG_SLOT_REPLAY
+>
 class Database {
 public:
     /*
@@ -132,6 +136,24 @@ private:
         long offset;
     };
     using Index = std::map<Key, LogPointer>;
+
+    struct LogSlot {
+        // TODO: crc
+        int numKvs;
+        char kvs[LOG_SLOT_PAYLOAD_SIZE];
+    };
+
+    static const long LOG_HEADER_SIZE = sizeof(LogHeader);
+    // Log header needs to be written atomically, so it cannot exceed the size
+    // of the atomic write unit of the storage medium.
+    // TODO: there's probably some alignment stuff to worry about as well.
+    static_assert(LOG_HEADER_SIZE <= 512, "Log header size exceeds atomic write unit size.");
+    static const long LOG_SLOT_SIZE = sizeof(LogSlot);
+    // One extra log slot because log slot writes are not necessarily atomic.
+    static const long NUM_LOG_SLOT = NUM_LOG_SLOT_REPLAY + 1;
+    static const long FILE_SIZE = LOG_HEADER_SIZE + NUM_LOG_SLOT * LOG_SLOT_SIZE;
+
+    using Log = LogSlot[NUM_LOG_SLOT];
 
     /*
      * Pointer to the fixed-location log header in the logFile.

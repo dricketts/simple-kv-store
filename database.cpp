@@ -10,41 +10,9 @@
 #include "serdes.h"
 #include "exceptions.h"
 
-// TODO: make all of these magic numbers configurable.
-
-static const long INT_SIZE = sizeof(int);
-static const long MAX_NUM_KV_PAIRS = 64;
-static const long MAX_KEY_SIZE = 1024;
-static const long MAX_VAL_SIZE = 4096;
-// Log array of kv pairs:
-//     length of key
-//     key
-//     length of value
-//     value
-static const long LOG_SLOT_PAYLOAD_SIZE = (INT_SIZE + MAX_KEY_SIZE + INT_SIZE + MAX_VAL_SIZE) * MAX_NUM_KV_PAIRS;
-
-struct LogSlot {
-    // TODO: crc
-    int numKvs;
-    char kvs[LOG_SLOT_PAYLOAD_SIZE];
-};
-
-
-static const long LOG_HEADER_SIZE = sizeof(LogHeader);
-// Log header needs to be written atomically, so it cannot exceed the size
-// of the atomic write unit of the storage medium.
-// TODO: there's probably some alignment stuff to worry about as well.
-static_assert(LOG_HEADER_SIZE <= 512, "Log header size exceeds atomic write unit size.");
-static const long LOG_SLOT_SIZE = sizeof(LogSlot);
-// Number of consecutive log slots required to replay the state machine
-static const long NUM_LOG_SLOT_REPLAY = 128;
-// One extra log slot because log slot writes are not necessarily atomic.
-static const long NUM_LOG_SLOT = NUM_LOG_SLOT_REPLAY + 1;
-static const long FILE_SIZE = LOG_HEADER_SIZE + NUM_LOG_SLOT * LOG_SLOT_SIZE;
-
-using Log = LogSlot[NUM_LOG_SLOT];
-
-Database::Database(const std::string& fileName, bool doFormat) :
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+Database(const std::string& fileName, bool doFormat) :
     logFile_(fileName, FILE_SIZE),
     slotRWMutexes_(NUM_LOG_SLOT)
 {
@@ -60,18 +28,24 @@ Database::Database(const std::string& fileName, bool doFormat) :
     commitThread_ = std::thread(&Database::commitLoop, this, std::move(commitPromise));
 }
 
-Database::~Database() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+~Database() {
     cancelPromise_.set_value();
     commitThread_.join();
 }
 
-void Database::format() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+format() {
     LogHeader* lh = getLogHeader();
     lh->head = 0;
     persist();
 }
 
-void Database::replay() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+replay() {
     Index index;
     const LogHeader* lh = getLogHeader();
     for (long slot = std::max(0L, lh->head - NUM_LOG_SLOT_REPLAY); slot < lh->head; ++slot) {
@@ -88,11 +62,14 @@ void Database::replay() {
     latestIndex_ = std::make_shared<Index>(index);
 }
 
-void Database::persist() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+persist() {
     logFile_.persist();
 }
 
-struct Database::TransactionMD {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+struct Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::TransactionMD {
     std::shared_ptr<Index> readIndex;
     std::map<Key, Value> writes;
     size_t writeSize = 0;
@@ -101,7 +78,9 @@ struct Database::TransactionMD {
 
 // TODO: handle too many writes here.
 // Also, give read and write some way of failing the transaction.
-TransactionResult Database::performTransaction(Transaction txn) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+TransactionResult Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+performTransaction(Transaction txn) {
     Database::TransactionMD txnMD = beginTransaction();
     auto txnRead = [this, &txnMD](const Key& key) -> const std::optional<Value> {
         return read(key, txnMD);
@@ -114,11 +93,16 @@ TransactionResult Database::performTransaction(Transaction txn) {
 }
 
 // TODO: concurrency control for log trimming
-Database::TransactionMD Database::beginTransaction() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+typename Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::TransactionMD
+Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+beginTransaction() {
     return {.readIndex = getIndex()};
 }
 
-const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+const std::optional<Value> Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+read(const Key& key, TransactionMD& txnMD) {
     txnMD.readSet.insert(key);
 
     // Try to read from local writes
@@ -143,13 +127,17 @@ const std::optional<Value> Database::read(const Key& key, TransactionMD& txnMD) 
     return v;
 }
 
-void Database::write(const Key& key, const Value& value, TransactionMD& txnMD) const {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+write(const Key& key, const Value& value, TransactionMD& txnMD) const {
     // TODO: does move make any sense here?
     txnMD.writes[key] = std::move(value);
     txnMD.writeSize += kvSerializedSize(key, value);
 }
 
-TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txnMD) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+TransactionResult Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+tryCommit(bool wantsCommit, const TransactionMD& txnMD) {
     //   1. Acquire commit mutex
     //   2. Wait for space in pending log slot
     //   3. check for conflicts
@@ -172,12 +160,16 @@ TransactionResult Database::tryCommit(bool wantsCommit, const TransactionMD& txn
     return TransactionResult::Success;
 }
 
-bool Database::checkConflicts(const TransactionMD& txnMD) const {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+bool Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+checkConflicts(const TransactionMD& txnMD) const {
     return true;
 }
 
 // Precondition: thread holds commitMutex
-std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+std::shared_future<void> Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+append(const std::map<Key, Value>& kvs) {
     updateSlotAndExec(pendingLogP_.slot, [this, &kvs](LogSlot* ls){
         ls->numKvs += kvs.size();
         for (auto& [k, v] : kvs) {
@@ -190,7 +182,9 @@ std::shared_future<void> Database::append(const std::map<Key, Value>& kvs) {
     return commitFuture_;
 }
 
-size_t Database::pendingSpace() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+size_t Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+pendingSpace() {
     return LOG_SLOT_PAYLOAD_SIZE - pendingLogP_.offset;
 }
 
@@ -201,7 +195,9 @@ size_t Database::pendingSpace() {
 // slot and stage 2 persists the header pointing to that log slot.
 //
 // The input promise corresponds to commitFuture.
-void Database::commitLoop(std::promise<void> commitPromise) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+commitLoop(std::promise<void> commitPromise) {
     LogHeader* lh = getLogHeader();
     
     // There will never be any references to the future for the initial value of
@@ -230,7 +226,9 @@ void Database::commitLoop(std::promise<void> commitPromise) {
     }
 }
 
-void Database::resetPending() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+resetPending() {
     pendingIndex_ = *getIndex();
     LogHeader* lh = getLogHeader();
     pendingHeader_ = *lh;
@@ -241,7 +239,9 @@ void Database::resetPending() {
     });
 }
 
-void Database::updateSlotAndExec(long slot, std::function<void (LogSlot*)> exec) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+updateSlotAndExec(long slot, std::function<void (LogSlot*)> exec) {
     SlotRWMutex& srw = slotRWMutexes_[getPhysicalLogSlot(slot)];
     std::scoped_lock lock(srw.mutex);
     // TODO: check slot for non-decreasing
@@ -254,7 +254,9 @@ void Database::updateSlotAndExec(long slot, std::function<void (LogSlot*)> exec)
     }
 }
 
-void Database::checkSlotAndExec(long slot, std::function<void (const LogSlot*)> exec) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+checkSlotAndExec(long slot, std::function<void (const LogSlot*)> exec) {
     SlotRWMutex& srw = slotRWMutexes_[getPhysicalLogSlot(slot)];
     // TODO: try_to_lock?
     // no point on blocking if the lock is held in exclusive mode
@@ -269,22 +271,33 @@ void Database::checkSlotAndExec(long slot, std::function<void (const LogSlot*)> 
     }
 }
 
-LogHeader* Database::getLogHeader() const {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+LogHeader* Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+getLogHeader() const {
     return reinterpret_cast<LogHeader*>(logFile_.getBasePointer());
 }
 
-long Database::getPhysicalLogSlot(long n) const {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+long Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+getPhysicalLogSlot(long n) const {
     return n % NUM_LOG_SLOT;
 }
 
-LogSlot* Database::getLogSlot(long n) const {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+typename Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::LogSlot* Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+getLogSlot(long n) const {
     return reinterpret_cast<LogSlot*>(logFile_.getBasePointer() + LOG_HEADER_SIZE) + getPhysicalLogSlot(n);
 }
 
-std::shared_ptr<Database::Index> Database::getIndex() {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+std::shared_ptr<typename Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::Index>
+Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+getIndex() {
     return std::atomic_load(&latestIndex_);
 }
 
-void Database::updateIndex(const Index& newIndex) {
+template <long LOG_SLOT_PAYLOAD_SIZE, long NUM_LOG_SLOT_REPLAY>
+void Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>::
+updateIndex(const Index& newIndex) {
     std::atomic_store(&latestIndex_, std::make_shared<Index>(newIndex));
 }

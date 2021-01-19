@@ -3,7 +3,8 @@
 #include <optional>
 #include <string>
 
-#include "database.h"
+// #include "database.h"
+#include "database.cpp"
 #include "util.h"
 
 static std::optional<Value> readAndExpect(ReadFn readKey, const Key& key,
@@ -13,11 +14,24 @@ static std::optional<Value> readAndExpect(ReadFn readKey, const Key& key,
     return v;
 }
 
+static const long INT_SIZE = sizeof(int);
+static const long MAX_NUM_KV_PAIRS = 64;
+static const long MAX_KEY_SIZE = 1024;
+static const long MAX_VAL_SIZE = 4096;
+// Log array of kv pairs:
+//     length of key
+//     key
+//     length of value
+//     value
+static const long LOG_SLOT_PAYLOAD_SIZE = (INT_SIZE + MAX_KEY_SIZE + INT_SIZE + MAX_VAL_SIZE) * MAX_NUM_KV_PAIRS;
+static const long NUM_LOG_SLOT_REPLAY = 128;
+using DB = Database<LOG_SLOT_PAYLOAD_SIZE, NUM_LOG_SLOT_REPLAY>;
+
 static void test1() {
     std::cout << "Starting test 1" << std::endl;
     int maxRound1 = 248;
     {
-        Database db("test_db.db", true);
+        DB db("test_db.db", true);
 
         for (int i = 1; i <= maxRound1; ++i) {
             db.performTransaction([i](ReadFn readKey, WriteFn writeKey) {
@@ -32,7 +46,7 @@ static void test1() {
     std::cout << "==================" << std::endl;
 
     {
-        Database db("test_db.db", false);
+        DB db("test_db.db", false);
         for (int i = 1; i < 10; ++i) {
             db.performTransaction([i, maxRound1](ReadFn readKey, WriteFn writeKey) {
                 auto v = readAndExpect(readKey, "K", std::to_string(maxRound1 + i - 1));
@@ -47,7 +61,7 @@ static void test1() {
 
 static void test2() {
     std::cout << "Starting test 2" << std::endl;
-    Database db("test_db.db", true);
+    DB db("test_db.db", true);
     std::vector<std::thread> threads;
     for (int i = 0; i < 1024; ++i) {
         threads.push_back(
@@ -67,7 +81,7 @@ static void test2() {
 
 static void test3() {
     std::cout << "Starting test 3" << std::endl;
-    Database db("test_db.db", true);
+    DB db("test_db.db", true);
     std::vector<std::thread> threads;
     for (int i = 0; i < 1024; ++i) {
         threads.push_back(
